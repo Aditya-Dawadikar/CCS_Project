@@ -1,16 +1,17 @@
 import socket
 import random
 import time
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from collections import deque
 
 CLIENT_ID = "Specter"
 PACKET_LIMIT = 10_000_000
-INIT_SEQ = 70000
+INIT_SEQ = 0
 PKT_LEN = 4
 FLOW_SIZE = 1
 SEQ_WRAP = 65536
 
+_exit_flag = Event()
 _sent = 0
 _attempts = 0
 _cur_seq = INIT_SEQ
@@ -22,19 +23,70 @@ _seen = set()
 _cycle = 0
 _created = 0
 _is_linked = False
-
 _sock = None
+
+drp_lock = Lock()
+win_lock = Lock()
 
 log_drop = open(f"drops_{int(time.time())}.csv", "w")
 log_drop.write("sid,tstamp\n")
-drp_lock = Lock()
-
 log_win = open(f"winlog_{int(time.time())}.csv", "w")
 log_win.write("wsize,tstamp\n")
-win_lock = Lock()
+
+def should_drop():
+    return random.random() < 0.01
+
+def record_miss(seq, t, loop):
+    pid = f"{seq}_{loop}"
+    _seen.add((seq, t))
+    if pid in _resend_log[0]:
+        if pid in _resend_log[1]:
+            if pid in _resend_log[2]:
+                _resend_log[3].append(pid)
+            else:
+                _resend_log[2].append(pid)
+        else:
+            _resend_log[1].append(pid)
+    else:
+        _resend_log[0].append(pid)
+    with drp_lock:
+        log_drop.write(f"{seq},{t}\n")
+
+def note_window(ws, t):
+    with win_lock:
+        log_win.write(f"{ws},{t}\n")
+
+def reset_state():
+    global _sent, _attempts, _cur_seq, _wsize, _sched, _misses, _seen, _resend_log, _cycle, _created
+    _sent = 0
+    _attempts = 0
+    _cur_seq = INIT_SEQ
+    _wsize = FLOW_SIZE
+    _sched = []
+    _misses = deque()
+    _seen = set()
+    _resend_log = [[], [], [], []]
+    _cycle = 0
+    _created = 0
+
+def shutdown():
+    try:
+        if _sock:
+            _sock.shutdown(socket.SHUT_RDWR)
+            _sock.close()
+    except:
+        pass
+    log_drop.close()
+    log_win.close()
+
+def summarize():
+    print(f"Client: {socket.gethostbyname(socket.gethostname())}")
+    print(f"Sent: {_attempts}")
+    print("Retries - 1x:{0} 2x:{1} 3x:{2} 4x:{3}".format(*map(len, _resend_log)))
 
 def init_socket():
-    global _sock, _sent, _attempts, _cur_seq, _wsize, _sched, _misses, _resend_log, _cycle, _created, _is_linked
+    global _sock, _sent, _attempts, _cur_seq, _wsize, _sched, _misses
+    global _resend_log, _cycle, _created, _is_linked
 
     host = socket.gethostname()
     port = 4001
@@ -56,6 +108,7 @@ def init_socket():
     msg = _sock.recv(2048).decode()
     if msg == "NEW":
         print("Linked Fresh")
+        reset_state()
     elif msg.startswith("OLD"):
         print("Resyncing...")
         _sock.send("SND".encode())
@@ -68,60 +121,50 @@ def init_socket():
         _sock.sendall(sync_info.encode())
     else:
         print("Server unreachable!")
-        exit()
+        return -1
 
     try:
         emit_stream()
+    except KeyboardInterrupt:
+        print("\n[!] Client manually interrupted.")
+        _exit_flag.set()
     except Exception as e:
-        print(e)
+        print("Emit error:", e)
+    finally:
         summarize()
-        reconnect()
+        shutdown()
+
+    return 0
 
 def reconnect():
     global _is_linked
     _is_linked = False
-    try:
-        while not _is_linked:
-            init_socket()
-            time.sleep(1)
-    except:
-        summarize()
-        reconnect()
+    reset_state()
 
-def should_drop():
-    return random.random() < 0.01
-
-def record_miss(seq, t, loop):
-    pid = f"{seq}_{loop}"
-    _seen.add((seq, t))
-    if pid in _resend_log[0]:
-        if pid in _resend_log[1]:
-            if pid in _resend_log[2]:
-                _resend_log[3].append(pid)
-            else:
-                _resend_log[2].append(pid)
-        else:
-            _resend_log[1].append(pid)
-    else:
-        _resend_log[0].append(pid)
-
-    with drp_lock:
-        log_drop.write(f"{seq},{t}\n")
-
-def note_window(ws, t):
-    with win_lock:
-        log_win.write(f"{ws},{t}\n")
+    while not _is_linked and not _exit_flag.is_set():
+        try:
+            result = init_socket()
+            if result == 0:
+                return
+            print("Retrying in 10 sec...")
+            _exit_flag.wait(timeout=10)
+        except KeyboardInterrupt:
+            print("\n[!] User interrupted during reconnect.")
+            _exit_flag.set()
+            break
+        except Exception as e:
+            print(f"Connection error: {e}")
+            _exit_flag.wait(timeout=10)
 
 def emit_stream():
-    global _sock, _sent, _attempts, _cur_seq, _wsize, _sched, _misses, _seen, _resend_log, _cycle, _created
+    global _sock, _sent, _attempts, _cur_seq, _wsize, _sched, _misses, _seen
+    global _resend_log, _cycle, _created
 
-    if _cur_seq < SEQ_WRAP:
-        print(f"Resuming @ seq: {_cur_seq}, Already sent {_sent}")
+    print(f"Resuming @ seq: {_cur_seq}, Already sent {_sent}")
 
-    while _sent < PACKET_LIMIT:
+    while _sent < PACKET_LIMIT and not _exit_flag.is_set():
         _sched = []
         wait_ack = 0
-        flagged = False
 
         for _ in range(_wsize):
             if _created < PACKET_LIMIT:
@@ -129,13 +172,11 @@ def emit_stream():
                     while len(_sched) <= _wsize and _misses:
                         _sched.append(_misses.popleft())
                     break
-
                 if _cur_seq + PKT_LEN > SEQ_WRAP:
-                    _cur_seq = 1
+                    _cur_seq = 0
                     _cycle += 1
                 else:
                     _cur_seq += PKT_LEN
-
                 _created += 1
                 _sched.append(_cur_seq)
             else:
@@ -147,22 +188,31 @@ def emit_stream():
             _attempts += 1
             if should_drop():
                 _misses.append(item)
-                flagged = True
                 Thread(target=record_miss, args=(item, time.time(), _cycle)).start()
                 if _wsize > 1:
                     _wsize = max(1, _wsize // 2)
                     Thread(target=note_window, args=(_wsize, time.time())).start()
             else:
                 wait_ack += 1
-                _sock.sendall((str(item) + " ").encode())
-                _sent += 1
+                try:
+                    _sock.sendall((str(item) + " ").encode())
+                    _sent += 1
+                except Exception as e:
+                    print(f"[!] Send failure: {e}")
+                    return reconnect()
 
         _sock.settimeout(0.5)
         try:
             feed = _sock.recv(8192).decode()
+            if "FIN" in feed:
+                print("[!] Server closed session.")
+                break
             confirmations = list(map(int, feed.split()))
-        except:
-            wait_ack = 0
+        except socket.timeout:
+            print("[!] Receive timeout. Reconnecting...")
+            return reconnect()
+        except Exception as e:
+            print("[!] Error receiving: ", e)
             return reconnect()
 
         for ack in confirmations:
@@ -173,50 +223,20 @@ def emit_stream():
         Thread(target=note_window, args=(_wsize, time.time())).start()
         _sock.settimeout(None)
 
-        if _attempts % 10 == 0:
-            print(f"Dispatched {_attempts} packets...")
+        if _attempts % 100 == 0:
+            print(f"[>] Progress: {_sent} packets sent, Window size: {_wsize}")
 
     summarize()
     shutdown()
-
-def summarize():
-    print(f"Client: {socket.gethostbyname(socket.gethostname())}")
-    print(f"Sent: {_attempts}")
-    print("Retries - 1x:{0} 2x:{1} 3x:{2} 4x:{3}".format(*map(len, _resend_log)))
-
-def shutdown():
-    time.sleep(1)
-    log_drop.close()
-    log_win.close()
-    _sock.close()
-
-def reset_state():
-    global _sent, _attempts, _cur_seq, _wsize, _sched, _misses, _seen, _resend_log, _cycle, _created
-    _sent = 0
-    _attempts = 0
-    _cur_seq = INIT_SEQ
-    _wsize = FLOW_SIZE
-    _sched = []
-    _misses = deque()
-    _seen = set()
-    _resend_log = [[], [], [], []]
-    _cycle = 0
-    _created = 0
-
-# if __name__ == '__main__':
-#     t0 = time.time()
-#     reconnect()
-#     t1 = time.time()
-#     print("Elapsed:", t1 - t0)
 
 if __name__ == '__main__':
     t0 = time.time()
     try:
         reconnect()
     except KeyboardInterrupt:
-        print("\n[!] Interrupted by user. Shutting down...")
+        print("\n[!] Interrupted by user. Exiting...")
+        _exit_flag.set()
     finally:
         summarize()
         shutdown()
-        t1 = time.time()
-        print("Elapsed:", t1 - t0)
+        print(f"Elapsed: {time.time() - t0:.2f} sec")
